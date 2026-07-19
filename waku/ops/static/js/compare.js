@@ -6,9 +6,63 @@
 // compare_models in dashboard.py) — this is a benchmark, not a conversation, so
 // nothing here touches your real memory or calendar.
 
-// State survives the 5s refresh redraw (the view rebuilds from here).
+// State survives the 5s refresh redraw (the view rebuilds from here) AND — via
+// localStorage — tab switches and full reloads, so a finished race isn't lost.
+// Kept out of the chat log on purpose: a benchmark isn't a conversation.
 let compareState = { message: "Build a Kanto team around Pikachu — search current picks, remember it, and schedule two training sessions this week.",
-                     picked: null, running: false, results: null };
+                     picked: null, running: false, results: null, order: null, sortBy: "latency" };
+try {
+  const saved = JSON.parse(localStorage.getItem("waku_compare") || "null");
+  if (saved){ compareState.message = saved.message ?? compareState.message;
+              compareState.results = saved.results || null;
+              // only restore columns that actually finished (drop any stale racing… ones)
+              compareState.order = (saved.order || []).filter(s => saved.results && saved.results[s]); }
+} catch(e){}
+function saveCompare(){
+  try { localStorage.setItem("waku_compare", JSON.stringify({
+    message: compareState.message, order: compareState.order, results: compareState.results})); } catch(e){}
+}
+
+// --- Compare history: past races + a cumulative per-model scoreboard, from the
+// server's own compare/history.jsonl (never the agent's real state). Loaded once
+// when the tab opens and refreshed after each race.
+async function loadCompareHistory(){
+  try {
+    const h = await (await fetch("/api/compare/history")).json();
+    compareState.history = h.runs || [];
+    compareState.aggregate = h.aggregate || [];
+  } catch(e){ compareState.history = []; compareState.aggregate = []; }
+  editing = false;   // ensure the scoreboard redraw isn't skipped by the edit-guard
+  render();
+}
+// Sort the scoreboard by a column: same column flips asc<->desc, a new column
+// starts ascending (lowest/best first for time/tokens/cost).
+function setBoardSort(key){
+  const b = compareState.boardSort || {key: "total_cost_usd", dir: "asc"};
+  compareState.boardSort = (b.key === key) ? {key, dir: b.dir === "asc" ? "desc" : "asc"} : {key, dir: "asc"};
+  editing = false; render();
+}
+async function clearCompareHistory(){
+  if (!confirm("Clear the compare scoreboard and race history? (Only the arena's own log — your real data is untouched.)")) return;
+  const r = await postJSON("/api/compare/clear", {});
+  compareState.history = r.runs || []; compareState.aggregate = r.aggregate || [];
+  editing = false; render();
+}
+// A stored (slimmed) result -> the shape compareCol expects (gate object, tool
+// objects), so a past race renders identically to a live one.
+function adaptHistResult(r){
+  return {...r, gate: r.gate ? {decision: r.gate} : null,
+          tools: (r.tools || []).map(t => ({tool: t}))};
+}
+// Reopen a past race into the columns (read-only view of that run).
+function openCompareRun(idx){
+  const run = (compareState.history || [])[idx];
+  if (!run) return;
+  compareState.order = run.results.map(r => r.spec);
+  compareState.results = {}; run.results.forEach(r => { compareState.results[r.spec] = adaptHistResult(r); });
+  compareState.message = run.message;
+  render();
+}
 
 // Which models are offered: your pinned shortlist (models.json). Default-pick
 // the first (flagship) of each provider so the race is one brain per lab.
@@ -23,9 +77,22 @@ function compareModels(d){
   return pinned;
 }
 
+function setCompareSort(key){
+  compareState.sortBy = key;
+  editing = false;   // release the textarea lock so the re-sort redraw shows
+  render();
+}
 function toggleCompareModel(spec){
   const s = compareState.picked;
   s.has(spec) ? s.delete(spec) : s.add(spec);
+  editing = false;   // release the textarea edit-lock so this redraw isn't
+  render();          // skipped by the guard (else the count/chips go stale)
+}
+// Grade-with-K3 toggle: when on, each column's reply is judged 0-10 by kimi-k3
+// (an extra API call per column, so it's opt-in).
+function toggleJudge(){
+  compareState.judge = !compareState.judge;
+  editing = false;
   render();
 }
 
@@ -41,10 +108,11 @@ async function runCompare(){
   compareState.results = {};       // spec -> result, filled as they land
   compareState.raceError = null;
   render();
+  const R = compareState.results;
   try {
     const res = await fetch("/api/compare/stream", {method:"POST",
       headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({message: compareState.message, models: specs})});
+      body: JSON.stringify({message: compareState.message, models: specs, judge: !!compareState.judge})});
     const reader = res.body.getReader(), dec = new TextDecoder();
     let buf = "";
     for(;;){
@@ -56,28 +124,71 @@ async function runCompare(){
         const line = buf.slice(0, i); buf = buf.slice(i+2);
         if (!line.startsWith("data:")) continue;
         let ev; try { ev = JSON.parse(line.slice(5).trim()); } catch(e){ continue; }
-        if (ev.kind === "result" && ev.spec){ compareState.results[ev.spec] = ev; render(); }
+        const s = ev.spec;
+        // The harness plays out live: start -> gate -> tools, then the final
+        // result with receipts. (We don't token-stream the reply — see
+        // compare_stream in dashboard.py for why.)
+        if (ev.kind === "start"){ R[s] = {spec:s, provider:ev.provider, model:ev.model, streaming:true, tools:[], gate:null}; render(); }
+        else if (ev.kind === "gate" && R[s]){ R[s].gate = {decision:ev.decision, reason:ev.reason}; render(); }
+        else if (ev.kind === "tool" && R[s]){ (R[s].tools = R[s].tools||[]).push({tool:ev.tool}); render(); }
+        else if (ev.kind === "result" && s){ R[s] = ev; saveCompare(); render(); }
         else if (ev.kind === "done"){ if (ev.error) compareState.raceError = ev.error; }
       }
     }
   } catch(e){ compareState.raceError = String(e); }
-  compareState.running = false; render();
+  compareState.running = false; saveCompare();
+  // The server just logged this race; loadCompareHistory re-renders with the
+  // fresh (race-inclusive) totals. No intermediate render(), so the live-folded
+  // rows hand off to the server totals without a flicker.
+  loadCompareHistory();
 }
 
-// One contestant's result column. Reuses the shared formatters (gateBadge/
-// toolRow/renderMarkdown/secs/money) so it reads like the chat cards.
+// One contestant's column. While the model runs (res.streaming) it plays out
+// live like the chat dock — gate badge, tool chips light up, reply types in with
+// a caret. When it finishes (res.result) it flips to the full receipts card.
+// Reuses the shared formatters (renderMarkdown/secs/money).
+// Plain-English reason for the common, expected failure modes — so the arena
+// reads honestly on camera (the raw error stays below, muted).
+function compareErrorReason(err){
+  const e = (err || "").toLowerCase();
+  if (e.includes("reasoning_effort") || e.includes("/v1/responses")) return "can't call tools — reasoning model, needs the /v1/responses API";
+  if (e.includes("thought_signature")) return "can't call tools — missing thought_signature echo";
+  if (e.includes("credit") || e.includes("permission-denied") || e.includes("license")) return "no credits/licenses on this provider";
+  if (e.includes("max_tokens")) return "token-parameter mismatch";
+  if (e.includes("not found") || e.includes("no longer available")) return "model id not available";
+  return null;
+}
 function compareCol(res){
-  if (res.error) return `<div class="cmp-col err"><div class="cmp-h"><code>${esc(res.model)}</code>
-    <span class="srcpill apple">error</span></div><div class="meta">${esc(res.error)}</div></div>`;
+  if (res.error){
+    const why = compareErrorReason(res.error);
+    return `<div class="cmp-col err"><div class="cmp-h"><span class="mm-prov">${esc(res.provider)}</span> <code>${esc(res.model)}</code>
+      <span class="srcpill apple">error</span></div>
+      ${why?`<div class="meta" style="color:var(--bad)"><b>${esc(why)}</b></div>`:""}
+      <div class="meta" style="opacity:.7">${esc(res.error)}</div></div>`;
+  }
   const tools = (res.tools||[]).map(t => `<span class="stage done">tool · ${esc(t.tool)}</span>`).join("");
-  return `<div class="cmp-col">
-    <div class="cmp-h"><span class="mm-prov">${esc(res.provider)}</span> <code>${esc(res.model)}</code></div>
+  const gateBadgeHtml = `<span class="badge ${res.gate&&res.gate.decision==="retrieve"?"retrieve":""}">gate · ${esc(res.gate?res.gate.decision:"…")}</span>`;
+  if (res.streaming){
+    return `<div class="cmp-col">
+      <div class="cmp-h"><span class="mm-prov">${esc(res.provider)}</span> <code>${esc(res.model)}</code>
+        <span class="live-dot"></span></div>
+      <div class="cmp-stats">${gateBadgeHtml}</div>
+      ${tools?`<div class="stages" style="flex-wrap:wrap">${tools}</div>`:""}
+      <div class="meta">${(res.tools||[]).length?"running tools…":"thinking…"} <span class="caret"></span></div>
+    </div>`;
+  }
+  const c = res.completion;
+  const completionBadge = c ? `<span class="cmp-score ${c.passed?"pass":"fail"}" title="${esc(c.why||"")}">${c.passed?"solved":"failed"}${c.passed?"":" · "+esc(c.why||"")}</span>` : "";
+  const q = res.quality;
+  const qualityBadge = q && q.score!=null ? `<span class="cmp-q ${q.score>=7?"hi":q.score>=4?"mid":"lo"}" title="${esc(q.reason||"")} — judge: ${esc(q.judge||"")}">K3 ${q.score}/10</span>` : "";
+  return `<div class="cmp-col${c?(c.passed?" solved":" failed"):""}">
+    <div class="cmp-h"><span class="mm-prov">${esc(res.provider)}</span> <code>${esc(res.model)}</code>${completionBadge}${qualityBadge}</div>
     <div class="cmp-stats">
-      <span class="badge ${res.gate&&res.gate.decision==="retrieve"?"retrieve":""}">gate · ${esc(res.gate?res.gate.decision:"—")}</span>
-      <span class="chip">${secs(res.latency_ms)}</span>
+      ${gateBadgeHtml}
+      <span class="chip ${compareState.sortBy==="latency"?"sorted":""}">${secs(res.latency_ms)}</span>
       <span class="chip">${res.iterations??"?"} iter</span>
-      <span class="chip money">${money(res.cost_usd||0)}</span>
-      <span class="chip">${(res.tokens_in||0)+(res.tokens_out||0)} tok</span>
+      <span class="chip ${compareState.sortBy==="cost"?"money":""}">${money(res.cost_usd||0)}</span>
+      <span class="chip ${compareState.sortBy==="tokens"?"sorted":""}">${(res.tokens_in||0)+(res.tokens_out||0)} tok</span>
     </div>
     ${tools?`<div class="stages" style="flex-wrap:wrap">${tools}</div>`:""}
     <div class="r cmp-reply">${renderMarkdown(res.reply||"")}</div>
@@ -99,31 +210,171 @@ VIEWS.compare = function(d){
   const order = compareState.order || [];
   if (order.length){
     const results = compareState.results || {};
-    const done = order.map(s => results[s]).filter(Boolean).filter(r => !r.error);
-    const summary = done.length
-      ? `Isolated temp runs — nothing saved to your data.
-         Fastest: <b>${secs(Math.min(...done.map(r=>r.latency_ms)))}</b> ·
-         Cheapest: <b>${money(Math.min(...done.map(r=>r.cost_usd||0)))}</b>
-         · ${done.length}/${order.length} done`
-      : `Racing ${order.length} models in isolated sandboxes — columns fill as each finishes.`;
-    const cols = order.map(s => {
+    // "done" = finished successfully (not streaming, not errored) — only these
+    // have latency/cost for the fastest/cheapest summary.
+    const done = order.map(s => results[s]).filter(Boolean).filter(r => !r.error && !r.streaming);
+    // Sort key: the finished cards rank ascending by the chosen metric (least is
+    // best — fastest / cheapest / fewest tokens), winner to the top-left.
+    const metric = { latency: r => r.latency_ms || 0,
+                     cost:    r => r.cost_usd || 0,
+                     tokens:  r => (r.tokens_in || 0) + (r.tokens_out || 0) };
+    const key = metric[compareState.sortBy] || metric.latency;
+    const sorters = [["latency", "seconds"], ["tokens", "tokens"], ["cost", "money"]];
+    // Prominent, tab-like sort buttons — the selected one is highlighted.
+    const sortBar = done.length ? `<div class="cmp-sortbar">sort by ${sorters.map(([k, label]) =>
+      `<button class="cmp-sortbtn ${compareState.sortBy === k ? "on" : ""}" onclick="setCompareSort('${k}')">${label}</button>`).join("")}</div>` : "";
+    // Only a progress line while the race is still running; once every column is
+    // in, the sort tabs + cards + scoreboard say it all (no redundant summary).
+    const summary = done.length < order.length
+      ? `Racing ${order.length} models — ${done.length}/${order.length} done`
+      : "";
+    // Rank finished models first (by the chosen metric), then still-running,
+    // then errors — so as the race resolves, the best rises to the top-left.
+    const rank = s => {
+      const r = results[s];
+      if (!r) return [2, 0];                       // not started
+      if (r.error) return [3, 0];                  // failed -> end
+      if (r.streaming) return [1, 0];              // running -> middle
+      return [0, key(r)];                          // done -> front, best-of-metric first
+    };
+    const shown = [...order].sort((a, b) => { const ra = rank(a), rb = rank(b); return ra[0] - rb[0] || ra[1] - rb[1]; });
+    const cols = shown.map(s => {
       const r = results[s];
       if (r) return compareCol(r);
       return `<div class="cmp-col"><div class="cmp-h"><span class="mm-prov">${esc(s.split(":")[0])}</span> <code>${esc(s.split(":").slice(1).join(":"))}</code></div>
         <div class="meta">racing… <span class="caret"></span></div></div>`;
     }).join("");
-    grid = `<div class="meta" style="margin:2px 0 8px">${summary}</div><div class="cmp-grid">${cols}</div>`
+    grid = `${summary ? `<div class="meta" style="margin:2px 0 6px">${summary}</div>` : ""}${sortBar}<div class="cmp-grid">${cols}</div>`
       + (compareState.raceError ? `<div class="meta" style="color:var(--bad)">${esc(compareState.raceError)}</div>` : "");
   }
 
+  // Load the history once when the tab first opens (setting [] first stops the
+  // 5s refresh from re-triggering); loadCompareHistory re-renders when it lands.
+  if (compareState.history === undefined){ compareState.history = []; setTimeout(loadCompareHistory, 0); }
+
   return `<div class="card">
-    <div class="meta" style="margin-bottom:6px">One message, every brain at once — same harness, isolated homes, real receipts (gate · latency · cost · tools). Compare, don't guess.</div>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+      <span class="meta">One message, every brain at once — same harness, isolated homes, real receipts (gate · latency · cost · tools). Compare, don't guess.</span>
+      <label class="cmp-judge ${compareState.judge?"on":""}" style="margin-left:auto" title="Grade each reply 0-10 with kimi-k3 (one extra API call per column)">
+        <input type="checkbox" ${compareState.judge?"checked":""} onchange="toggleJudge()"> grade with K3</label>
+      <button class="save cmp-race" onclick="runCompare()" ${(!n||compareState.running)?"disabled":""}>
+        ${compareState.running?"Racing…":`Race ${n} model${n===1?"":"s"}`}</button>
+    </div>
     <textarea id="cmp-msg" class="cmp-input" rows="2" onfocus="markEditing()"
       oninput="compareState.message=this.value">${esc(compareState.message)}</textarea>
     <div class="cmp-picks">${chips}</div>
-    <div style="margin-top:10px">
-      <button class="save" onclick="runCompare()" ${(!n||compareState.running)?"disabled":""}>
-        ${compareState.running?"Racing…":`Race ${n} model${n===1?"":"s"}`}</button>
-    </div>
-  </div>${grid}`;
+  </div>${grid}${compareHistoryHtml()}`;
 };
+
+// The cumulative view under the current race: a per-model scoreboard averaged
+// across every logged race, then the list of recent races (click to reopen).
+// Data comes from GET /api/compare/history (the arena's own JSONL, never the
+// agent's real state).
+// The scoreboard the board shows = the server's totals (finished races) PLUS,
+// while a race is still running, its already-finished columns folded in — so a
+// model's numbers land the moment ITS column finishes, instead of waiting for
+// the slowest model in the race. No double count: the running race isn't in the
+// server totals yet, and once it completes running=false so we stop folding it.
+function boardAggregate(){
+  const map = {};
+  (compareState.aggregate || []).forEach(a => { map[a.spec] = {...a}; });
+  if (compareState.running){
+    (compareState.order || []).forEach(spec => {
+      const r = (compareState.results || {})[spec];
+      if (!r || r.streaming) return;   // column not finished yet
+      const a = map[spec] || (map[spec] = {spec, provider: r.provider, model: r.model,
+        runs: 0, ok: 0, total_latency_ms: 0, total_tokens_in: 0, total_tokens_out: 0,
+        total_tokens: 0, total_cost_usd: 0, cases_passed: 0, cases_scored: 0,
+        _qsum: 0, quality_n: 0, quality_avg: null});
+      a.runs += 1;
+      if (!r.error){
+        a.ok += 1;
+        a.total_latency_ms += r.latency_ms || 0;
+        a.total_tokens_in += r.tokens_in || 0;
+        a.total_tokens_out += r.tokens_out || 0;
+        a.total_tokens = a.total_tokens_in + a.total_tokens_out;
+        a.total_cost_usd = Math.round((a.total_cost_usd + (r.cost_usd || 0)) * 10000) / 10000;
+      }
+      if (r.completion){ a.cases_scored += 1; a.cases_passed += r.completion.passed ? 1 : 0; }
+      if (r.quality && r.quality.score!=null){
+        // reconstruct the running sum from the server row's avg on first fold
+        if (a._qsum===undefined){ a._qsum = (a.quality_avg||0) * (a.quality_n||0); }
+        a._qsum += r.quality.score; a.quality_n = (a.quality_n||0) + 1;
+        a.quality_avg = Math.round(a._qsum / a.quality_n * 10) / 10;
+      }
+    });
+  }
+  return Object.values(map);
+}
+// The reveal: total cost (x) vs how good (y). Y is K3's grade when we have it,
+// else the completion pass-rate — so "cheap AND good" sits top-LEFT. This is the
+// picture the whole arena is built to draw ("is opus 20x the price 20x better?").
+function costQualityScatter(agg){
+  const useQ = agg.some(a => a.quality_avg != null);
+  const pts = agg.map(a => {
+    let y = null;
+    if (useQ && a.quality_avg != null) y = a.quality_avg;                       // 0-10
+    else if (!useQ && a.cases_scored) y = a.cases_passed / a.cases_scored * 10; // 0-10
+    return {a, x: a.total_cost_usd || 0, y};
+  }).filter(p => p.y != null && p.x > 0);
+  if (pts.length < 2) return "";
+  const W = 640, H = 300, L = 46, R = 150, T = 16, B = 36;
+  const xmax = Math.max(...pts.map(p => p.x)) * 1.08 || 1;
+  const px = x => L + (x / xmax) * (W - L - R);
+  const py = y => H - B - (y / 10) * (H - T - B);
+  const gr = [0,2,4,6,8,10].map(v => `<line x1="${L}" y1="${py(v)}" x2="${W-R}" y2="${py(v)}" class="sc-grid"/>
+    <text x="${L-6}" y="${py(v)+3}" class="sc-tick" text-anchor="end">${v}</text>`).join("");
+  const dots = pts.sort((a,b)=>a.x-b.x).map(p => {
+    const good = p.y >= 7, mid = p.y >= 4;
+    const cls = good ? "hi" : mid ? "mid" : "lo";
+    return `<circle cx="${px(p.x).toFixed(1)}" cy="${py(p.y).toFixed(1)}" r="5" class="sc-dot ${cls}"/>
+      <text x="${(px(p.x)+9).toFixed(1)}" y="${(py(p.y)+3).toFixed(1)}" class="sc-lbl">${esc(p.a.model)} · ${money(p.x)}</text>`;
+  }).join("");
+  return `<div class="card" style="padding:12px 14px;margin-top:14px">
+    <div class="meta" style="margin-bottom:4px">Cost vs ${useQ?"quality (K3 grade)":"completion"} — cheap &amp; good is top-left</div>
+    <svg viewBox="0 0 ${W} ${H}" class="scatter" preserveAspectRatio="xMidYMid meet">
+      <line x1="${L}" y1="${T}" x2="${L}" y2="${H-B}" class="sc-axis"/>
+      <line x1="${L}" y1="${H-B}" x2="${W-R}" y2="${H-B}" class="sc-axis"/>
+      ${gr}${dots}
+      <text x="${(L+(W-R-L)/2).toFixed(0)}" y="${H-6}" class="sc-tick" text-anchor="middle">total cost →</text>
+      <text x="14" y="${(T+(H-B-T)/2).toFixed(0)}" class="sc-tick" text-anchor="middle" transform="rotate(-90 14 ${(T+(H-B-T)/2).toFixed(0)})">${useQ?"K3 grade":"completion"} →</text>
+    </svg></div>`;
+}
+function compareHistoryHtml(){
+  const agg = boardAggregate();
+  const hist = compareState.history || [];
+  const raceCount = hist.length + (compareState.running ? 1 : 0);
+  if (!agg.length && !hist.length) return "";
+  // Cumulative totals across all races. Click a column header to sort by it —
+  // ascending first, click again to flip (arrow shows the active column + dir).
+  const bs = compareState.boardSort || (compareState.boardSort = {key: "total_cost_usd", dir: "asc"});
+  const arrow = k => bs.key === k ? (bs.dir === "asc" ? " ▲" : " ▼") : "";
+  const th = (k, label) => `<th class="cmp-th ${bs.key===k?"on":""}" onclick="setBoardSort('${k}')">${label}${arrow(k)}</th>`;
+  const rows = [...agg].sort((x, y) => ((x[bs.key] ?? 0) - (y[bs.key] ?? 0)) * (bs.dir === "asc" ? 1 : -1));
+  const scoreboard = agg.length ? `
+    <h2 style="margin-top:22px;display:flex;align-items:center;gap:10px">Scoreboard
+      <span class="meta" style="font-weight:400">— totals across ${raceCount} race${raceCount===1?"":"s"}</span>
+      <a class="reveal" style="margin-left:auto;font-size:12px" onclick="clearCompareHistory()">clear</a></h2>
+    ${costQualityScatter(agg)}
+    <div class="card" style="padding:4px 8px"><table>
+      <tr><th>model</th>${th("cases_passed","solved")}${th("quality_avg","K3 grade")}${th("runs","races")}<th>ok</th>${th("total_latency_ms","total time")}${th("total_tokens_in","in tok")}${th("total_tokens_out","out tok")}${th("total_tokens","total tok")}<th title="list price per million tokens, input / output">rate $/M</th>${th("total_cost_usd","total cost")}</tr>
+      ${rows.map(a=>`<tr>
+        <td><span class="mm-prov">${esc(a.provider)}</span> <code>${esc(a.model)}</code></td>
+        <td>${a.cases_scored?`<span class="cmp-score ${a.cases_passed===a.cases_scored?"pass":(a.cases_passed?"part":"fail")}">${a.cases_passed}/${a.cases_scored}</span>`:'<span class="meta">—</span>'}</td>
+        <td>${a.quality_avg!=null?`<span class="cmp-q ${a.quality_avg>=7?"hi":a.quality_avg>=4?"mid":"lo"}">${a.quality_avg}</span>`:'<span class="meta">—</span>'}</td>
+        <td class="meta">${a.runs}</td><td class="meta">${a.ok}/${a.runs}</td>
+        <td class="meta">${secs(a.total_latency_ms)}</td>
+        <td class="meta">${a.total_tokens_in}</td><td class="meta">${a.total_tokens_out}</td>
+        <td class="meta">${a.total_tokens}</td>
+        <td class="meta">${a.rate_in!=null?`$${a.rate_in}/$${a.rate_out}`:"—"}</td>
+        <td class="meta" style="color:var(--good)">${money(a.total_cost_usd)}</td></tr>`).join("")}
+    </table></div>` : "";
+  const recent = hist.length ? `
+    <h2 style="margin-top:18px">Recent races <span class="meta" style="font-weight:400">— click to reopen</span></h2>
+    <div class="card">${hist.map((run,i)=>`
+      <div class="pinrow" style="cursor:pointer" onclick="openCompareRun(${i})">
+        <code style="flex:1;word-break:break-all">${esc((run.message||"").slice(0,90))}</code>
+        <span class="meta" style="white-space:nowrap">${(run.results||[]).length} models · ${esc((run.ts||"").slice(0,16).replace("T"," "))}</span>
+      </div>`).join("")}</div>` : "";
+  return scoreboard + recent;
+}
